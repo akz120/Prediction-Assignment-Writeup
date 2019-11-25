@@ -1,0 +1,179 @@
+---
+title: "Prediction Assignment Writeup"
+author: "Alma Zhantleuova"
+date: "11/21/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#### Objectives of the project:
+The goal of this project is to utilize machine learning to predict which one of the 5 ways (the classe variable in the dataset) the barbell lift falls under.  A training and test dataset has been provided.
+
+#### Background:
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves. In this project, my goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+---
+### Preparation of the data
+
+Downloading and importing the dataset into R:
+
+```{r, cache=TRUE, results='hide'}
+library(caret)
+library(doMC)
+registerDoMC(cores = 8)
+set.seed(1234)
+setwd("/USERS/zhan_alma/desktop/coursera/")
+#Download data
+trainurl = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(trainurl, destfile = "PMLtrain.csv", method = "curl")
+testurl = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(testurl, destfile = "PMLtest.csv", method = "curl")
+#Read Into Data Frame
+Train = read.csv("PMLtrain.csv", na.strings = c('#DIV/0!', 'NA'))
+Test = read.csv("PMLtest.csv", na.strings = c('#DIV/0!', 'NA'))
+```
+
+---
+
+#### Data Exploration
+
+In order to get a feeling of what I am working with I used the head and summary commands and plotting some variables. There is missing data that will not be analysed. Also, the data frame seems to have 160 columns, which might complicate the research. Due to constraints in length of the document, I hid the results. 
+
+```{r, results='hide', echo=FALSE}
+head(Train)
+summary(Train)
+table(Train$new_window, Train$classe)
+table(Train$user_name, Train$classe)
+table(Train$num_window, Train$classe)
+```
+
+---
+
+#### First step of processing the data
+
+The following are the commands necessary for removing NA and zero variance columns, summarizing training data by window, and classifying the training data into an 80/20 train and validtion set to assess model accuracy. 
+
+```{r, warning=F, results='hide'}
+#Find columns that have near zero variance
+library(caret)
+NotZeroVarIndex = nearZeroVar(Train, saveMetrics = T)$zeroVar == F
+ColumnsToKeep = names(Train)[NotZeroVarIndex]
+#Find columns that are mostly NAs
+KeepCol = function(x){
+  return(sum(is.na(x)) > 19000)}
+NACols = names(Train)[sapply(Train, KeepCol)]
+#Build List of Columsn To Keep
+ColumnsToKeep = ColumnsToKeep[!(ColumnsToKeep %in% c('X', 'user_name', 'cvtd_timestamp', 'new_window', 
+                                                     'raw_timestamp_part_1', 'raw_timestamp_part_2', 'classe', NACols))]
+#Subset All Data To Exclude Offenders
+Train = Train[, c(ColumnsToKeep, 'classe')]
+Test = Test[, ColumnsToKeep]
+#Summarize Training Data by num_window.  
+MeanNA = function(x){
+  return(mean(x, na.rm = T))}
+MTrain = aggregate(. ~ num_window, data = Train, MeanNA)
+MTrain$classe = as.factor(MTrain$classe)
+#Split Test Set into Test & Validation
+index = createDataPartition(MTrain$classe, p= .8, list = FALSE)
+MTrain = MTrain[index, ]
+MValidate = MTrain[-index, ]
+#Alternate Version of Training Set Split Into X & Y
+XTrain = MTrain[, 1:ncol(MTrain) - 1]
+YTrain = MTrain$classe
+```
+
+
+**Feature Selection, using CFS**  
+
+```{r, warning=F}
+library(FSelector)
+#See What Relevant Features Are - But Exclude Num Window
+RelevantFeatures = cfs(classe ~. , MTrain[2:54])
+RelevantFeatures
+```
+
+**Perform PCA**
+```{r, results='hide', message=FALSE, warning=FALSE}
+CSx = preProcess(XTrain, method = c('center', 'scale'))
+CSXtrain = predict(CSx, XTrain)
+PCAx = princomp(CSXtrain)
+summary(PCAx)
+```
+The otuput of summary illustrates that the first 12 prinicpal components manage to explain 80% of the vairance of the dataset.  Thus in theory using only 12 of them would be sufficient for the research. 
+
+####Model Training
+
+For model evaluation "Caret" package was used.
+There are three versions of the model I tested 
+- Random Forest Using PCA 
+- Random Forest withtout any priori feature selection 
+- Random Forest Using feature selection from CFS
+
+Configure 10-fold cross validation and Pre-processing
+```{r}
+TC = trainControl(method = 'cv', number = 10)
+rfGrid = expand.grid(mtry = (1:15))
+```
+
+- random forest with PCA using default parameters
+```{r, warning=FALSE, results='hide', cache=TRUE, message=FALSE}
+PCAx = preProcess(XTrain, method = 'pca', thresh = .8)
+XTrainPCA = predict(PCAx, XTrain)
+rfPCA = train(x = XTrainPCA, y = YTrain, method = 'rf', trainControl = TC, tuneGrid = rfGrid)
+```
+
+
+- random Forest On Dataset
+```{r, warning=FALSE, results='hide', cache=TRUE, message=FALSE}
+rf = train(classe~., data = MTrain, method = 'rf',
+              trainControl = TC, tuneGrid = rfGrid, preProcess = c('center', 'scale'))
+```
+
+- random Forest With CFS Feature Selection and Center/Scaling
+```{r, warning=FALSE, results='hide', cache=TRUE, message=FALSE}
+rfCFS = train(classe~., data = MTrain[,c(RelevantFeatures, 'classe')], method = 'rf', preProcess = c('center', 'scale'), 
+            trainControl = TC, tuneGrid = rfGrid)
+```
+
+
+##Model Selection
+
+Comparing three models using the builtin caret functionality
+```{r}
+resamps <- resamples(list(rf.plain= rf,
+                          rf.pca = rfPCA,
+                          rf.cfs = rfCFS))
+                          
+trellis.par.set(caretTheme())
+dotplot(resamps, main = 'Model Comparison: Random Forest With and Without Feature Selection', ylab = 'Model Used')
+```
+
+**Conclusion:** The best model turned out to be the random forest "out of the box" (second model), compared to the rest two.  The expkanation to it might be the fact that the random forests have built in feature selection.
+
+---
+
+### Model Evaluation
+Estimating the performance of the chosen model with the new dataset. There is a nuance that has provided me two difference results, both of them are quite satisfactory: 
+
+The very first estimate is the 87.9% accuracy, which resulted while ignoring the validation set by partitioning the test set into an 80/20 split in the beginning of this exercise.However, then model is run against the validation set, it shows 100% accuracy.So it is possible that the model performs better when all the data in the training set allowed. 
+
+Here is a readout of the final model's result on cross validation:
+
+```{r}
+rf$finalModel
+rf$bestTune
+rf$results
+```
+
+
+Below is the confusion matrix for my model run against the validation dataset. 
+```{r, warning=FALSE, message=FALSE}
+confusionMatrix(predict(rf, MValidate), MValidate$classe)
+```
+
+### Conclusion
+There are couple of points that are worth being mentioned. Before conducting any sort of analysis it is absolutely necessary to remove NA and null variance columns. Removing timestamps helped with the problem of high-dimensinionality, however in case of RF it wasn't necessary.The cross validation mean accuracy amounted to 87.9%, which is a reasonable estimate of how the model will perform on new data.
+
